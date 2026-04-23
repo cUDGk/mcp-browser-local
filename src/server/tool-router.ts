@@ -4,7 +4,7 @@ import type { ServerContext } from "./context.js";
 import { listInstallations } from "../detect/installations.js";
 import { listRunningBrowsers } from "../detect/running.js";
 import { ToolError } from "../core/errors.js";
-import { runTool } from "../tools/helpers.js";
+import { coerceArray, coerceObject, runTool } from "../tools/helpers.js";
 import { detectEndpointFromPort, detectEndpointFromRunningBrowser } from "../backends/chromium/attach.js";
 import { launchChromium } from "../backends/chromium/launch.js";
 import { activateTab, closeTab, listTargets, newTab } from "../backends/chromium/targets.js";
@@ -132,6 +132,8 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
           throw new ToolError("UNSUPPORTED_OPERATION", "Launch mode is disabled by configuration");
         }
 
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        normalized.windowSize = coerceObject(normalized.windowSize);
         const args = z.object({
           browser: browserEnum,
           executablePath: z.string().optional(),
@@ -142,7 +144,7 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
             width: z.number().positive(),
             height: z.number().positive()
           }).optional()
-        }).parse(rawArgs ?? {});
+        }).parse(normalized);
 
         let executablePath = args.executablePath;
         if (!executablePath) {
@@ -319,25 +321,30 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
       });
     case "browser_get_text":
       return runTool({}, async () => {
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        normalized.target = coerceObject(normalized.target);
         const args = z.object({
           sessionId: z.string(),
           tabId: z.string().optional(),
           target: z.object({ selector: z.string() }).optional(),
           maxChars: z.number().int().positive().optional()
-        }).parse(rawArgs ?? {});
+        }).parse(normalized);
         const tabId = resolveTabId(context, args.sessionId, args.tabId);
         context.sessions.addTabNote(args.sessionId, tabId, "Extracted visible text");
         return getText(context.sessions.getSession(args.sessionId), tabId, args.target, args.maxChars ?? context.config.maxTextChars);
       });
     case "browser_get_html":
       return runTool({}, async () => {
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        const coercedTarget = coerceObject(normalized.target);
+        if (coercedTarget !== undefined) normalized.target = coercedTarget;
         const args = z.object({
           sessionId: z.string(),
           tabId: z.string().optional(),
           target: z.object({ selector: z.string() }),
           mode: z.enum(["outerHTML", "innerHTML"]).default("outerHTML"),
           maxChars: z.number().int().positive().optional()
-        }).parse(rawArgs ?? {});
+        }).parse(normalized);
         const tabId = resolveTabId(context, args.sessionId, args.tabId);
         context.sessions.addTabNote(args.sessionId, tabId, `Extracted HTML (${args.mode})`);
         return getHtml(context.sessions.getSession(args.sessionId), tabId, args.target, args.maxChars ?? context.config.maxHtmlChars, args.mode);
@@ -349,22 +356,28 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
       });
     case "browser_click":
       return runTool({}, async () => {
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        const coercedTarget = coerceObject(normalized.target);
+        if (coercedTarget !== undefined) normalized.target = coercedTarget;
         const args = z.object({
           sessionId: z.string(),
           tabId: z.string().optional(),
           target: z.object({ elementRef: z.string().optional(), selector: z.string().optional(), textQuery: z.string().optional() })
-        }).parse(rawArgs ?? {});
+        }).parse(normalized);
         return click(context.sessions, context.sessions.getSession(args.sessionId), resolveTabId(context, args.sessionId, args.tabId), args.target);
       });
     case "browser_type":
       return runTool({}, async () => {
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        const coercedTarget = coerceObject(normalized.target);
+        if (coercedTarget !== undefined) normalized.target = coercedTarget;
         const args = z.object({
           sessionId: z.string(),
           tabId: z.string().optional(),
           target: z.object({ elementRef: z.string().optional(), selector: z.string().optional(), textQuery: z.string().optional() }),
           text: z.string(),
           clearFirst: z.boolean().default(true)
-        }).parse(rawArgs ?? {});
+        }).parse(normalized);
         return typeText(context.sessions, context.sessions.getSession(args.sessionId), resolveTabId(context, args.sessionId, args.tabId), args.target, args.text, args.clearFirst);
       });
     case "browser_press_key":
@@ -469,6 +482,8 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
       });
     case "browser_pdf_extract":
       return runTool({}, async () => {
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        normalized.pages = coerceArray(normalized.pages);
         const args = z.object({
           sessionId: z.string().optional(),
           tabId: z.string().optional(),
@@ -476,7 +491,7 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
           url: z.string().url().optional(),
           pages: z.array(z.number().int().positive()).optional(),
           maxCharsPerPage: z.number().int().positive().optional()
-        }).parse(rawArgs ?? {});
+        }).parse(normalized);
         const resolvedUrl = args.url ?? (args.sessionId ? await getCurrentUrl(context.sessions.getSession(args.sessionId), resolveTabId(context, args.sessionId, args.tabId)) : undefined);
         const extracted = await extractPdf({
           filePath: args.filePath,
@@ -501,7 +516,10 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
       });
     case "browser_set_cookies":
       return runTool({}, async () => {
-        const args = z.object({ sessionId: z.string(), tabId: z.string().optional(), cookies: z.array(z.record(z.any())) }).parse(rawArgs ?? {});
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        const coercedCookies = coerceArray(normalized.cookies);
+        if (coercedCookies !== undefined) normalized.cookies = coercedCookies;
+        const args = z.object({ sessionId: z.string(), tabId: z.string().optional(), cookies: z.array(z.record(z.any())) }).parse(normalized);
         return setCookies(context.sessions.getSession(args.sessionId), resolveTabId(context, args.sessionId, args.tabId), args.cookies);
       });
     case "browser_storage_get":
@@ -511,7 +529,10 @@ export async function callTool(context: ServerContext, name: string, rawArgs: un
       });
     case "browser_storage_set":
       return runTool({}, async () => {
-        const args = z.object({ sessionId: z.string(), tabId: z.string().optional(), kind: z.enum(["localStorage", "sessionStorage"]), entries: z.record(z.string()) }).parse(rawArgs ?? {});
+        const normalized = { ...(rawArgs as Record<string, unknown> ?? {}) };
+        const coercedEntries = coerceObject(normalized.entries);
+        if (coercedEntries !== undefined) normalized.entries = coercedEntries;
+        const args = z.object({ sessionId: z.string(), tabId: z.string().optional(), kind: z.enum(["localStorage", "sessionStorage"]), entries: z.record(z.string()) }).parse(normalized);
         return setStorage(context.sessions.getSession(args.sessionId), resolveTabId(context, args.sessionId, args.tabId), args.kind, args.entries);
       });
     default:

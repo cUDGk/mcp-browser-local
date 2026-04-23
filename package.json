@@ -1,6 +1,6 @@
 {
   "name": "mcp-browser-local",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local Chromium MCP server for Codex and Claude Code",
   "type": "module",
   "bin": {

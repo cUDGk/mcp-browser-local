@@ -190,6 +190,13 @@ npm run typecheck  # 型チェックのみ
 
 (Windows 11 / Brave / Node.js 22 環境での実測値)
 
+## 変更履歴
+
+### 0.1.1
+
+- Claude Code などの LLM クライアントが object / array 型の引数を JSON 文字列として送ってくる挙動に対応。`target` / `windowSize` / `cookies` / `entries` / `pages` などを文字列で受け取っても zod reject せずに自動で JSON パースしてから検証する
+- 対象ツール: `browser_launch` (windowSize)、`browser_get_text` / `browser_get_html` / `browser_click` / `browser_type` (target)、`browser_set_cookies` (cookies)、`browser_storage_set` (entries)、`browser_pdf_extract` (pages)
+
 ## ライセンス
 
 MIT License — Copyright (c) 2026 cUDGk

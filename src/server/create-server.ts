@@ -9,7 +9,7 @@ export async function startServer(context: ServerContext): Promise<void> {
   const server = new Server(
     {
       name: "mcp-browser-local",
-      version: "0.1.0"
+      version: "0.1.1"
     },
     {
       capabilities: {

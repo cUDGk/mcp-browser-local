@@ -101,3 +101,10 @@ npm run typecheck
 - `browser_pdf_open` reuses the current tab by default. Pass `newTab: true` only when isolation is worth the extra tab.
 - Tabs opened by MCP are tracked and closed automatically on `browser_disconnect`.
 - Use `browser_list_managed_tabs` and `browser_note_tab` to inspect or annotate the tabs MCP touched.
+
+## Changelog
+
+### 0.1.1
+
+- Tolerate object / array arguments that Claude Code and similar LLM clients send as JSON strings. Tools now auto-parse stringified payloads before zod validation instead of rejecting them.
+- Affected tools: `browser_launch` (windowSize), `browser_get_text` / `browser_get_html` / `browser_click` / `browser_type` (target), `browser_set_cookies` (cookies), `browser_storage_set` (entries), `browser_pdf_extract` (pages).
