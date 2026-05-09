@@ -1,6 +1,7 @@
-﻿import { execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
+import { ToolError } from "../core/errors.js";
 import type { RunningBrowser } from "../types/session.js";
 import type { BrowserKind } from "../types/common.js";
 
@@ -19,9 +20,11 @@ type ProcessRow = {
   Path?: string;
 };
 
-type ListeningPortRow = {
+type TcpConnectionRow = {
   LocalAddress?: string;
+  LocalPort?: number;
   OwningProcess?: number;
+  State?: string | number;
 };
 
 export async function listRunningBrowsers(): Promise<RunningBrowser[]> {
@@ -46,7 +49,7 @@ export async function listRunningBrowsers(): Promise<RunningBrowser[]> {
     }
 
     const debuggingPort = debuggingPorts.get(row.Id);
-    const attachable = Number.isFinite(debuggingPort);
+    const attachable = debuggingPort !== undefined && Number.isFinite(debuggingPort);
 
     return [{
       processId: row.Id,
@@ -74,12 +77,55 @@ async function listBrowserProcesses(): Promise<ProcessRow[]> {
     maxBuffer: 1024 * 1024 * 2
   });
 
-  const parsed = stdout.trim() ? JSON.parse(stdout) : [];
-  return Array.isArray(parsed) ? parsed : [parsed];
+  return parseJsonRows<ProcessRow>(stdout);
 }
 
+// B20: prefer Get-NetTCPConnection (structured) over netstat parsing.
 async function listListeningPortsByProcess(processIds: number[]): Promise<Map<number, number[]>> {
   const pidSet = new Set(processIds);
+  const portsByProcess = new Map<number, number[]>();
+
+  const psScript = [
+    "$ErrorActionPreference='Stop';",
+    "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue",
+    "| Select-Object LocalAddress,LocalPort,OwningProcess,State",
+    "| ConvertTo-Json -Depth 3"
+  ].join(" ");
+
+  let rows: TcpConnectionRow[] = [];
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-Command", psScript], {
+      windowsHide: true,
+      maxBuffer: 1024 * 1024 * 4
+    });
+    rows = parseJsonRows<TcpConnectionRow>(stdout);
+  } catch {
+    // Fallback to netstat if Get-NetTCPConnection fails (e.g. Server Core, restricted env).
+    return parsePortsFromNetstat(pidSet);
+  }
+
+  for (const row of rows) {
+    if (row.OwningProcess === undefined || row.LocalPort === undefined) {
+      continue;
+    }
+    if (!pidSet.has(row.OwningProcess)) {
+      continue;
+    }
+    // Reject out-of-range port values from PowerShell output.
+    if (!validPort(row.LocalPort)) {
+      continue;
+    }
+    const ports = portsByProcess.get(row.OwningProcess) ?? [];
+    if (!ports.includes(row.LocalPort)) {
+      ports.push(row.LocalPort);
+      portsByProcess.set(row.OwningProcess, ports);
+    }
+  }
+
+  return portsByProcess;
+}
+
+async function parsePortsFromNetstat(pidSet: Set<number>): Promise<Map<number, number[]>> {
   const { stdout } = await execFileAsync("netstat.exe", ["-ano", "-p", "tcp"], {
     windowsHide: true,
     maxBuffer: 1024 * 1024 * 4
@@ -105,7 +151,7 @@ async function listListeningPortsByProcess(processIds: number[]): Promise<Map<nu
       continue;
     }
 
-    const port = parsePort(localAddress);
+    const port = localAddress ? parsePort(localAddress) : undefined;
     if (!port) {
       continue;
     }
@@ -122,8 +168,8 @@ async function listListeningPortsByProcess(processIds: number[]): Promise<Map<nu
 
 function parsePort(localAddress: string): number | undefined {
   const ipv6Match = localAddress.match(/\]:([0-9]+)$/);
-  if (ipv6Match) {
-    return Number.parseInt(ipv6Match[1] ?? "", 10);
+  if (ipv6Match && ipv6Match[1]) {
+    return validPort(Number.parseInt(ipv6Match[1], 10));
   }
 
   const index = localAddress.lastIndexOf(":");
@@ -131,8 +177,29 @@ function parsePort(localAddress: string): number | undefined {
     return undefined;
   }
 
-  const value = Number.parseInt(localAddress.slice(index + 1), 10);
-  return Number.isFinite(value) ? value : undefined;
+  return validPort(Number.parseInt(localAddress.slice(index + 1), 10));
+}
+
+/** Return the port only if it is a valid TCP port number (1-65535). */
+function validPort(value: number): number | undefined {
+  return Number.isInteger(value) && value >= 1 && value <= 65535 ? value : undefined;
+}
+
+// B19: don't crash if PowerShell returns malformed JSON.
+function parseJsonRows<T>(stdout: string): T[] {
+  const trimmed = stdout.trim();
+  if (!trimmed) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    throw new ToolError("INTERNAL_ERROR", "Failed to parse PowerShell JSON output", false, {
+      cause: error instanceof Error ? error.message : String(error)
+    });
+  }
+  if (Array.isArray(parsed)) return parsed as T[];
+  if (parsed && typeof parsed === "object") return [parsed as T];
+  return [];
 }
 
 async function detectDebuggingPorts(portsByProcessId: Map<number, number[]>): Promise<Map<number, number>> {
@@ -168,4 +235,3 @@ async function isDebuggingEndpoint(port: number): Promise<boolean> {
     clearTimeout(timeout);
   }
 }
-
