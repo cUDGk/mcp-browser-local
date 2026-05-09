@@ -2,6 +2,7 @@ import CDP from "chrome-remote-interface";
 import { ToolError } from "../../core/errors.js";
 import type { BrowserEndpoint, BrowserTargetSummary } from "../../types/session.js";
 
+// B16: drop the bogus `active` field — listTargets has no notion of foreground tab.
 export async function listTargets(endpoint: BrowserEndpoint): Promise<BrowserTargetSummary[]> {
   const targets = await CDP.List({ host: endpoint.host, port: endpoint.port });
   return targets
@@ -10,8 +11,7 @@ export async function listTargets(endpoint: BrowserEndpoint): Promise<BrowserTar
       tabId: target.id,
       title: target.title,
       url: target.url,
-      type: target.type,
-      active: target.type === "page"
+      type: target.type
     }));
 }
 
@@ -21,8 +21,7 @@ export async function newTab(endpoint: BrowserEndpoint, url = "about:blank"): Pr
     tabId: target.id,
     title: target.title,
     url: target.url,
-    type: target.type,
-    active: true
+    type: target.type
   };
 }
 

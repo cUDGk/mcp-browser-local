@@ -11,5 +11,6 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exitCode = 1;
+  // B24: hard-exit so the orchestrator sees a non-zero status.
+  process.exit(1);
 });

@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { ToolErrorCode, ToolFailure } from "../types/common.js";
 
 export class ToolError extends Error {
@@ -26,6 +27,13 @@ export class ToolError extends Error {
 export function asToolError(error: unknown, fallbackCode: ToolErrorCode = "INTERNAL_ERROR"): ToolError {
   if (error instanceof ToolError) {
     return error;
+  }
+
+  // B30: surface zod validation errors as INVALID_ARGUMENT with the issues array.
+  if (error instanceof z.ZodError) {
+    return new ToolError("INVALID_ARGUMENT", "Invalid arguments", false, {
+      issues: error.issues
+    });
   }
 
   if (error instanceof Error) {

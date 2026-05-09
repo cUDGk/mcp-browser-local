@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { execFile } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import type { ServerConfig } from "../config.js";
 import { ToolError } from "./errors.js";
+import { Logger } from "./logger.js";
 import type { BrowserSession, ElementRefRecord, ManagedPdfState, ManagedTabRecord } from "../types/session.js";
 
 type ManagedSession = BrowserSession & {
@@ -12,9 +17,21 @@ type ManagedSession = BrowserSession & {
 
 export class SessionManager {
   private readonly sessions = new Map<string, ManagedSession>();
+  // Use insertion-ordered Map so we can FIFO-evict element refs (S9).
   private readonly elementRefs = new Map<string, ElementRefRecord>();
+  private readonly logger: Logger;
+  private readonly config: ServerConfig;
+
+  constructor(config: ServerConfig, logger: Logger) {
+    this.config = config;
+    this.logger = logger;
+  }
 
   createSession(session: Omit<ManagedSession, "sessionId" | "createdAt" | "consoleLogs" | "networkLogs">): ManagedSession {
+    // S9: cap concurrent sessions.
+    if (this.sessions.size >= this.config.maxSessions) {
+      throw new ToolError("RESOURCE_LIMIT", `session count exceeds cap (${this.config.maxSessions})`);
+    }
     const managed: ManagedSession = {
       ...session,
       sessionId: `s_${crypto.randomUUID()}`,
@@ -39,13 +56,66 @@ export class SessionManager {
     return session;
   }
 
-  deleteSession(sessionId: string): void {
+  // B11: tear down child + temp profile dir on session removal.
+  async deleteSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       return;
     }
     if (session.childProcess && !session.childProcess.killed) {
-      session.childProcess.kill();
+      const pid = session.childProcess.pid;
+      try {
+        if (process.platform === "win32" && pid) {
+          await new Promise<void>((resolve) => {
+            execFile("taskkill.exe", ["/T", "/F", "/PID", String(pid)], { windowsHide: true }, () => resolve());
+          });
+        } else {
+          session.childProcess.kill("SIGTERM");
+          // B1: on POSIX, kill() returns synchronously but the child may still hold the
+          // profile dir for a beat. Wait (with deadline) for "exit" so the rm below sees
+          // a quiescent file tree.
+          await new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 3000);
+            session.childProcess!.once("exit", () => {
+              clearTimeout(t);
+              resolve();
+            });
+          });
+        }
+      } catch (error) {
+        this.logger.warn("failed to kill browser child", {
+          sessionId,
+          cause: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    // Remove temp profile dir if it lives under our tempDir.
+    // S9: resolve real paths on both sides — a symlink under tempDir pointing at $HOME
+    // would otherwise let us recursively rm the user's home directory.
+    if (session.profileMode === "isolated" && session.profilePath) {
+      try {
+        const realProfile = await fs.realpath(path.resolve(session.profilePath));
+        const realTemp = await fs.realpath(path.resolve(this.config.tempDir));
+        const isWin = process.platform === "win32";
+        const rel = path.relative(isWin ? realTemp.toLowerCase() : realTemp, isWin ? realProfile.toLowerCase() : realProfile);
+        if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+          await fs.rm(realProfile, { recursive: true, force: true });
+        } else {
+          this.logger.warn("skipping profile cleanup: not under tempDir", {
+            sessionId,
+            profilePath: realProfile
+          });
+        }
+      } catch (error) {
+        // realpath() failure (missing path / permission denied) means we can't
+        // safely confirm containment — skip the rm rather than fall back to an
+        // unresolved path.
+        this.logger.warn("failed to remove profile temp dir", {
+          sessionId,
+          profilePath: session.profilePath,
+          cause: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
     this.sessions.delete(sessionId);
     for (const [key, elementRef] of this.elementRefs.entries()) {
@@ -57,8 +127,12 @@ export class SessionManager {
 
   setActiveTab(sessionId: string, tabId: string): void {
     const session = this.getSession(sessionId);
-    session.activeTabId = tabId;
     if (!session.managedTabs.has(tabId)) {
+      // S9: cap tabs per session — check BEFORE setting activeTabId so we don't
+      // advance the pointer when the cap check would reject the new tab.
+      if (session.managedTabs.size >= this.config.maxTabsPerSession) {
+        throw new ToolError("RESOURCE_LIMIT", `tab count exceeds cap (${this.config.maxTabsPerSession})`);
+      }
       session.managedTabs.set(tabId, {
         tabId,
         createdAt: new Date().toISOString(),
@@ -66,11 +140,15 @@ export class SessionManager {
         notes: []
       });
     }
+    session.activeTabId = tabId;
   }
 
   registerTab(sessionId: string, tabId: string, openedByMcp: boolean, note?: string, url?: string): ManagedTabRecord {
     const session = this.getSession(sessionId);
     const existing = session.managedTabs.get(tabId);
+    if (!existing && session.managedTabs.size >= this.config.maxTabsPerSession) {
+      throw new ToolError("RESOURCE_LIMIT", `tab count exceeds cap (${this.config.maxTabsPerSession})`);
+    }
     const record: ManagedTabRecord = existing ?? {
       tabId,
       createdAt: new Date().toISOString(),
@@ -78,23 +156,36 @@ export class SessionManager {
       notes: []
     };
     record.openedByMcp = record.openedByMcp || openedByMcp;
-    record.lastKnownUrl = url ?? record.lastKnownUrl;
+    if (url !== undefined) {
+      record.lastKnownUrl = url;
+    }
     if (note) {
-      record.notes.push(note);
+      this.pushNote(record, note);
     }
     session.managedTabs.set(tabId, record);
     return record;
   }
 
+  // S9: ring-buffer notes per tab.
+  private pushNote(record: ManagedTabRecord, note: string): void {
+    record.notes.push(note);
+    const cap = this.config.maxNotesPerTab;
+    if (record.notes.length > cap) {
+      record.notes.splice(0, record.notes.length - cap);
+    }
+  }
+
   addTabNote(sessionId: string, tabId: string, note: string): ManagedTabRecord {
     const session = this.getSession(sessionId);
     const record = session.managedTabs.get(tabId) ?? this.registerTab(sessionId, tabId, false);
-    record.notes.push(note);
+    this.pushNote(record, note);
     session.managedTabs.set(tabId, record);
     return record;
   }
 
+  // B27: only update lastKnownUrl when the URL is non-empty.
   updateTabUrl(sessionId: string, tabId: string, url: string): void {
+    if (!url) return;
     const record = this.registerTab(sessionId, tabId, false);
     record.lastKnownUrl = url;
   }
@@ -130,6 +221,12 @@ export class SessionManager {
   }
 
   registerElementRef(ref: Omit<ElementRefRecord, "elementRef" | "createdAt">): ElementRefRecord {
+    // S9: FIFO-evict oldest elementRef when over cap.
+    while (this.elementRefs.size >= this.config.maxElementRefs) {
+      const oldestKey = this.elementRefs.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.elementRefs.delete(oldestKey);
+    }
     const elementRef: ElementRefRecord = {
       ...ref,
       elementRef: `e_${crypto.randomUUID()}`,
@@ -153,5 +250,9 @@ export class SessionManager {
         this.elementRefs.delete(key);
       }
     }
+  }
+
+  listSessionIds(): string[] {
+    return [...this.sessions.keys()];
   }
 }

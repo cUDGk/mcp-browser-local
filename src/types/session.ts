@@ -68,7 +68,6 @@ export type BrowserTargetSummary = {
   title: string;
   url: string;
   type: string;
-  active: boolean;
 };
 
 export type ElementRefRecord = {

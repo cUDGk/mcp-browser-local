@@ -34,6 +34,8 @@ export type ToolErrorCode =
   | "UPLOAD_PATH_NOT_ALLOWED"
   | "INVALID_ARGUMENT"
   | "UNSUPPORTED_OPERATION"
+  | "RESULT_TOO_LARGE"
+  | "RESOURCE_LIMIT"
   | "INTERNAL_ERROR";
 
 export type ToolFailure = {

@@ -9,9 +9,10 @@ export type ServerContext = {
 };
 
 export function createServerContext(config: ServerConfig): ServerContext {
+  const logger = new Logger(config);
   return {
     config,
-    logger: new Logger(config),
-    sessions: new SessionManager()
+    logger,
+    sessions: new SessionManager(config, logger)
   };
 }

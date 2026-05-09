@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { ServerConfig } from "../../config.js";
 import { ToolError } from "../../core/errors.js";
+import { sanitizeBasename, safeJsonForJs } from "../../core/security.js";
 import type { SessionManager } from "../../core/session-manager.js";
 import type { BrowserSession, BrowserTargetSummary } from "../../types/session.js";
 import type { PageSnapshot } from "../../types/snapshot.js";
@@ -37,7 +38,12 @@ async function withTab<T>(session: BrowserSession, tabId: string, fn: (client: A
     await Promise.all([client.Page.enable(), client.DOM.enable(), client.Runtime.enable(), client.Network.enable()]);
     return await fn(client);
   } finally {
-    await client.close();
+    // B1: don't let a failure in client.close() mask the real error.
+    try {
+      await client.close();
+    } catch {
+      // best-effort: connection already torn down or remote crashed
+    }
   }
 }
 
@@ -47,37 +53,62 @@ export async function listTabsForSession(session: BrowserSession): Promise<Brows
 
 export async function navigate(session: BrowserSession, tabId: string, url: string, waitUntil: "domcontentloaded" | "load" = "load", timeoutMs = 15000): Promise<{ url: string; title: string }> {
   return withTab(session, tabId, async (client) => {
+    // B2: subscribe BEFORE Page.navigate so we can't miss a fast lifecycle event.
     const wait = waitForLifecycle(client, waitUntil, timeoutMs);
-    await client.Page.navigate({ url });
-    await wait;
-    return getPageInfo(client);
+    try {
+      const result = await client.Page.navigate({ url });
+      // B6/B8: errorText takes priority — cancel the timer/listener so we don't leak it.
+      const errorText = (result as { errorText?: string }).errorText;
+      if (errorText) {
+        wait.cancel();
+        throw new ToolError("NAVIGATION_TIMEOUT", `Navigation failed: ${errorText}`, true, { url });
+      }
+      await wait.promise;
+      return getPageInfo(client);
+    } catch (err) {
+      wait.cancel();
+      throw err;
+    }
   });
 }
 
-export async function goBack(session: BrowserSession, tabId: string): Promise<{ url: string; title: string }> {
+export async function goBack(session: BrowserSession, tabId: string, timeoutMs = 15000): Promise<{ url: string; title: string }> {
   return withTab(session, tabId, async (client) => {
-    const wait = waitForLifecycle(client, "load", 15000);
-    await client.Runtime.evaluate({ expression: "history.back()", returnByValue: true });
-    await wait;
-    return getPageInfo(client);
+    const wait = waitForLifecycle(client, "load", timeoutMs);
+    try {
+      await client.Runtime.evaluate({ expression: "history.back()", returnByValue: true });
+      await wait.promise;
+      return getPageInfo(client);
+    } finally {
+      wait.cancel();
+    }
   });
 }
 
-export async function goForward(session: BrowserSession, tabId: string): Promise<{ url: string; title: string }> {
+export async function goForward(session: BrowserSession, tabId: string, timeoutMs = 15000): Promise<{ url: string; title: string }> {
   return withTab(session, tabId, async (client) => {
-    const wait = waitForLifecycle(client, "load", 15000);
-    await client.Runtime.evaluate({ expression: "history.forward()", returnByValue: true });
-    await wait;
-    return getPageInfo(client);
+    const wait = waitForLifecycle(client, "load", timeoutMs);
+    try {
+      await client.Runtime.evaluate({ expression: "history.forward()", returnByValue: true });
+      await wait.promise;
+      return getPageInfo(client);
+    } finally {
+      wait.cancel();
+    }
   });
 }
 
-export async function reload(session: BrowserSession, tabId: string): Promise<{ url: string; title: string }> {
+export async function reload(session: BrowserSession, tabId: string, timeoutMs = 15000): Promise<{ url: string; title: string }> {
   return withTab(session, tabId, async (client) => {
-    const wait = waitForLifecycle(client, "load", 15000);
-    await client.Page.reload({ ignoreCache: false });
-    await wait;
-    return getPageInfo(client);
+    const wait = waitForLifecycle(client, "load", timeoutMs);
+    try {
+      await client.Page.reload({ ignoreCache: false });
+      await wait.promise;
+      return getPageInfo(client);
+    } catch (err) {
+      wait.cancel();
+      throw err;
+    }
   });
 }
 
@@ -171,7 +202,8 @@ export async function snapshotPage(sessionManager: SessionManager, session: Brow
       }>;
     };
 
-    const documentResult = await client.DOM.getDocument({ depth: -1 });
+    // B15: depth -1 fully serializes the DOM; we only need root frame metadata.
+    const documentResult = await client.DOM.getDocument({ depth: 1 });
     const frameId = documentResult.root.frameId ?? "main";
     const loaderId = "current";
     const elements = raw.elements.map((element) => {
@@ -258,16 +290,50 @@ export async function getHtml(session: BrowserSession, tabId: string, target: Ta
   });
 }
 
+// S4: cap expression length, reject obvious code-loaders, race against a hard timeout.
+const FORBIDDEN_EVAL_PATTERNS: RegExp[] = [
+  /\bimport\s*\(/,
+  /\brequire\s*\(/,
+  /\bnew\s+Function\s*\(/,
+  /\bFunction\s*\(/
+];
+
 export async function evaluateExpression(session: BrowserSession, tabId: string, expression: string, config: ServerConfig): Promise<{ value: unknown }> {
   if (!config.allowEval) {
     throw new ToolError("EVAL_DISABLED", "Evaluation is disabled by server configuration");
   }
+  if (expression.length > config.maxEvalExpressionChars) {
+    throw new ToolError("INVALID_ARGUMENT", `expression exceeds ${config.maxEvalExpressionChars} chars`);
+  }
+  // S5/S6: strip /* */ and // comments, decode \uXXXX and \xXX escapes so attackers
+  // can't bypass the forbidden-token regexes via obfuscation.
+  const normalized = expression
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*/g, "")
+    .replace(/\\u([\da-f]{4})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\x([\da-f]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  for (const pattern of FORBIDDEN_EVAL_PATTERNS) {
+    if (pattern.test(normalized)) {
+      throw new ToolError("INVALID_ARGUMENT", "expression contains forbidden token (import / require / Function)");
+    }
+  }
 
   return withTab(session, tabId, async (client) => {
-    const result = await evaluateJson(client, expression);
-    const normalized = JSON.stringify(result.value);
-    if ((normalized?.length ?? 0) > config.maxEvalResultChars) {
-      throw new ToolError("INVALID_ARGUMENT", "Evaluation result exceeded the configured size limit");
+    const evalPromise = evaluateJson(client, expression);
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => reject(new ToolError("WAIT_TIMEOUT", `eval exceeded ${config.defaultCommandTimeoutMs}ms`, true)), config.defaultCommandTimeoutMs);
+    });
+    let result: RuntimeJsonResult;
+    try {
+      result = await Promise.race([evalPromise, timeoutPromise]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+    const resultJson = JSON.stringify(result.value) ?? "";
+    if (resultJson.length > config.maxEvalResultChars) {
+      // B13: distinct error code so callers can re-issue with a smaller scope.
+      throw new ToolError("RESULT_TOO_LARGE", `Evaluation result exceeded ${config.maxEvalResultChars} chars`);
     }
     return { value: result.value };
   });
@@ -281,6 +347,139 @@ export async function click(sessionManager: SessionManager, session: BrowserSess
     await client.Input.dispatchMouseEvent({ type: "mousePressed", x: box.x, y: box.y, button: "left", clickCount: 1 });
     await client.Input.dispatchMouseEvent({ type: "mouseReleased", x: box.x, y: box.y, button: "left", clickCount: 1 });
     return { clicked: true };
+  });
+}
+
+// U11: hover over an element by dispatching a "mouseMoved" event at its center.
+export async function hover(sessionManager: SessionManager, session: BrowserSession, tabId: string, target: TargetQuery): Promise<{ hovered: true }> {
+  return withTab(session, tabId, async (client) => {
+    const resolved = await resolveTarget(sessionManager, client, session.sessionId, tabId, target);
+    const box = await getBoxCenter(client, resolved.backendNodeId);
+    await client.Input.dispatchMouseEvent({ type: "mouseMoved", x: box.x, y: box.y });
+    return { hovered: true };
+  });
+}
+
+// U12: pick one or more options on a <select>. Fires the "input" + "change" events the
+// page is likely listening for, mirroring what a real user-driven selection does.
+export async function selectOption(
+  sessionManager: SessionManager,
+  session: BrowserSession,
+  tabId: string,
+  target: TargetQuery,
+  values: string[]
+): Promise<{ selected: string[] }> {
+  return withTab(session, tabId, async (client) => {
+    const resolved = await resolveTarget(sessionManager, client, session.sessionId, tabId, target);
+    const { object } = await client.DOM.resolveNode({ backendNodeId: resolved.backendNodeId });
+    if (!object.objectId) {
+      throw new ToolError("ELEMENT_NOT_INTERACTABLE", "Could not resolve <select> to a DOM object");
+    }
+    const result = await client.Runtime.callFunctionOn({
+      objectId: object.objectId,
+      functionDeclaration: `function(values) {
+        if (!(this instanceof HTMLSelectElement)) {
+          throw new Error("target is not a <select> element");
+        }
+        const target = new Set(values);
+        const matched = [];
+        for (const option of Array.from(this.options)) {
+          option.selected = target.has(option.value) || target.has(option.label);
+          if (option.selected) matched.push(option.value);
+        }
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
+        return matched;
+      }`,
+      arguments: [{ value: values }],
+      awaitPromise: true,
+      returnByValue: true
+    });
+    const selected = (result.result.value as string[] | undefined) ?? [];
+    return { selected };
+  });
+}
+
+// U13: set a checkbox / radio's checked state and fire input+change.
+export async function setChecked(
+  sessionManager: SessionManager,
+  session: BrowserSession,
+  tabId: string,
+  target: TargetQuery,
+  checked: boolean
+): Promise<{ checked: boolean }> {
+  return withTab(session, tabId, async (client) => {
+    const resolved = await resolveTarget(sessionManager, client, session.sessionId, tabId, target);
+    const { object } = await client.DOM.resolveNode({ backendNodeId: resolved.backendNodeId });
+    if (!object.objectId) {
+      throw new ToolError("ELEMENT_NOT_INTERACTABLE", "Could not resolve target node to a DOM object");
+    }
+    await client.Runtime.callFunctionOn({
+      objectId: object.objectId,
+      functionDeclaration: `function(checked) {
+        if (!(this instanceof HTMLInputElement) || (this.type !== 'checkbox' && this.type !== 'radio')) {
+          throw new Error("target is not a checkbox / radio input");
+        }
+        if (this.checked !== checked) {
+          this.checked = checked;
+          this.dispatchEvent(new Event('input', { bubbles: true }));
+          this.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }`,
+      arguments: [{ value: checked }],
+      awaitPromise: true,
+      returnByValue: true
+    });
+    return { checked };
+  });
+}
+
+// U14: wait until the page sustains "no in-flight requests" for `idleMs` consecutive ms,
+// or until `timeoutMs` elapses. Built on Network.requestWillBeSent / loadingFinished /
+// loadingFailed counters so we don't depend on Page lifecycle events.
+export async function waitForNetworkIdle(
+  session: BrowserSession,
+  tabId: string,
+  options: { idleMs?: number; timeoutMs?: number } = {}
+): Promise<{ idle: true; idleForMs: number }> {
+  const idleMs = options.idleMs ?? 500;
+  const timeoutMs = options.timeoutMs ?? 15000;
+  return withTab(session, tabId, async (client) => {
+    let inFlight = 0;
+    let lastChange = Date.now();
+    const onStart = () => {
+      inFlight += 1;
+      lastChange = Date.now();
+    };
+    const onEnd = () => {
+      inFlight = Math.max(0, inFlight - 1);
+      lastChange = Date.now();
+    };
+    const emitter = client as unknown as {
+      on: (evt: string, fn: () => void) => void;
+      removeListener: (evt: string, fn: () => void) => void;
+    };
+    emitter.on("Network.requestWillBeSent", onStart);
+    emitter.on("Network.loadingFinished", onEnd);
+    emitter.on("Network.loadingFailed", onEnd);
+    try {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (inFlight === 0 && Date.now() - lastChange >= idleMs) {
+          return { idle: true as const, idleForMs: Date.now() - lastChange };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new ToolError("WAIT_TIMEOUT", `Network did not idle within ${timeoutMs}ms (inFlight=${inFlight})`, true);
+    } finally {
+      try {
+        emitter.removeListener("Network.requestWillBeSent", onStart);
+        emitter.removeListener("Network.loadingFinished", onEnd);
+        emitter.removeListener("Network.loadingFailed", onEnd);
+      } catch {
+        // best-effort cleanup
+      }
+    }
   });
 }
 
@@ -333,7 +532,19 @@ export async function getPdfViewerState(session: BrowserSession, tabId: string):
   zoomPercent?: number;
   viewerUrl: string;
 }> {
-  return withTab(session, tabId, async (client) => {
+  return withTab(session, tabId, (client) => getPdfViewerStateInner(client));
+}
+
+// B4: separated so pdfNextPage / pdfPrevPage can reuse the outer withTab() client
+// instead of opening a second CDP socket against the same tab while the first is
+// still active (which produced "Target X already attached" intermittently).
+async function getPdfViewerStateInner(client: Awaited<ReturnType<typeof createTabClient>>): Promise<{
+  isPdfViewer: boolean;
+  currentPage?: number;
+  pageCount?: number;
+  zoomPercent?: number;
+  viewerUrl: string;
+}> {
     const info = await getPageInfo(client);
     const result = await evaluateJson(
       client,
@@ -414,14 +625,14 @@ export async function getPdfViewerState(session: BrowserSession, tabId: string):
       zoomPercent: value.zoomPercent,
       viewerUrl: info.url
     };
-  });
 }
 
 export async function pdfNextPage(session: BrowserSession, tabId: string): Promise<{ advanced: boolean; currentPage?: number; pageCount?: number }> {
+  // B4: reuse one withTab/CDP socket for both the click and the state read.
   return withTab(session, tabId, async (client) => {
     await advancePdfViewer(client, "next");
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const state = await getPdfViewerState(session, tabId);
+    const state = await getPdfViewerStateInner(client);
     return {
       advanced: true,
       currentPage: state.currentPage,
@@ -431,10 +642,11 @@ export async function pdfNextPage(session: BrowserSession, tabId: string): Promi
 }
 
 export async function pdfPrevPage(session: BrowserSession, tabId: string): Promise<{ advanced: boolean; currentPage?: number; pageCount?: number }> {
+  // B4: reuse one withTab/CDP socket for both the click and the state read.
   return withTab(session, tabId, async (client) => {
     await advancePdfViewer(client, "prev");
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const state = await getPdfViewerState(session, tabId);
+    const state = await getPdfViewerStateInner(client);
     return {
       advanced: true,
       currentPage: state.currentPage,
@@ -446,7 +658,7 @@ export async function pdfPrevPage(session: BrowserSession, tabId: string): Promi
 export async function scrollPage(session: BrowserSession, tabId: string, deltaX: number, deltaY: number): Promise<{ scrolled: true }> {
   return withTab(session, tabId, async (client) => {
     await client.Runtime.evaluate({
-      expression: `window.scrollBy(${deltaX}, ${deltaY});`,
+      expression: `window.scrollBy(${Number(deltaX) || 0}, ${Number(deltaY) || 0});`,
       awaitPromise: false,
       returnByValue: true
     });
@@ -454,14 +666,17 @@ export async function scrollPage(session: BrowserSession, tabId: string, deltaX:
   });
 }
 
-export async function takeScreenshot(session: BrowserSession, tabId: string, screenshotDir: string, nameHint?: string): Promise<{ path: string; format: "png" }> {
+export async function takeScreenshot(session: BrowserSession, tabId: string, screenshotDir: string, nameHint?: string): Promise<{ path: string; format: "png"; base64: string }> {
   return withTab(session, tabId, async (client) => {
     await fs.mkdir(screenshotDir, { recursive: true });
     const result = await client.Page.captureScreenshot({ format: "png", fromSurface: true });
-    const filename = `${nameHint ?? "screenshot"}-${Date.now()}.png`;
+    // S12: sanitize the nameHint — only [A-Za-z0-9_-] survive.
+    const safeHint = nameHint ? sanitizeBasename(nameHint) : "screenshot";
+    const filename = `${safeHint}-${Date.now()}.png`;
     const filePath = path.join(screenshotDir, filename);
     await fs.writeFile(filePath, Buffer.from(result.data, "base64"));
-    return { path: filePath, format: "png" };
+    // U15: return base64 alongside path so MCP clients can render inline.
+    return { path: filePath, format: "png", base64: result.data };
   });
 }
 
@@ -472,31 +687,76 @@ export async function getCookies(session: BrowserSession, tabId: string): Promis
   });
 }
 
-export async function setCookies(session: BrowserSession, tabId: string, cookies: Array<Record<string, unknown>>): Promise<{ set: number }> {
+// U15: explicit cookie shape that matches the zod schema in tool-router; this lets the
+// caller pass the inferred type directly without a runtime cast.
+export type CookieInput = {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: "Strict" | "Lax" | "None";
+  url?: string;
+};
+
+// B12: collect failures and surface them rather than silently skipping.
+export async function setCookies(session: BrowserSession, tabId: string, cookies: CookieInput[]): Promise<{ set: number; failed: Array<{ index: number; reason: string }> }> {
   return withTab(session, tabId, async (client) => {
     let count = 0;
-    for (const cookie of cookies) {
-      const result = await client.Network.setCookie(cookie as never);
-      if (result.success) {
-        count += 1;
+    const failed: Array<{ index: number; reason: string }> = [];
+    for (let i = 0; i < cookies.length; i++) {
+      const cookie = cookies[i]!;
+      try {
+        const result = await client.Network.setCookie(cookie);
+        if (result.success) {
+          count += 1;
+        } else {
+          failed.push({ index: i, reason: "browser rejected cookie" });
+        }
+      } catch (error) {
+        failed.push({ index: i, reason: error instanceof Error ? error.message : String(error) });
       }
     }
-    return { set: count };
+    return { set: count, failed };
   });
 }
 
 export async function getStorage(session: BrowserSession, tabId: string, kind: "localStorage" | "sessionStorage"): Promise<{ entries: Record<string, string> }> {
+  // S10: defense-in-depth — `kind` is template-interpolated into a JS source string below,
+  // so a non-canonical value (caller bypassing zod) would be a code-injection sink.
+  if (kind !== "localStorage" && kind !== "sessionStorage") {
+    throw new ToolError("INVALID_ARGUMENT", `invalid storage kind: ${kind}`);
+  }
   return withTab(session, tabId, async (client) => {
-    const result = await evaluateJson(client, `Object.fromEntries(Object.entries(${kind}).map(([key, value]) => [key, String(value)]))`);
+    // B26: iterate by index — Object.entries on Storage misses the prototype-defined indexer in some browsers.
+    const result = await evaluateJson(
+      client,
+      `(() => {
+        const out = {};
+        for (let i = 0; i < ${kind}.length; i++) {
+          const k = ${kind}.key(i);
+          if (k !== null) out[k] = String(${kind}.getItem(k));
+        }
+        return out;
+      })()`
+    );
     return { entries: (result.value as Record<string, string>) ?? {} };
   });
 }
 
 export async function setStorage(session: BrowserSession, tabId: string, kind: "localStorage" | "sessionStorage", entries: Record<string, string>): Promise<{ set: number }> {
+  // S10: same code-injection sink defense as getStorage above.
+  if (kind !== "localStorage" && kind !== "sessionStorage") {
+    throw new ToolError("INVALID_ARGUMENT", `invalid storage kind: ${kind}`);
+  }
   return withTab(session, tabId, async (client) => {
+    // S11: escape U+2028/U+2029 in JSON before inlining into a JS source string.
+    const payload = safeJsonForJs(entries);
     await client.Runtime.evaluate({
       expression: `(() => {
-        const entries = ${JSON.stringify(entries)};
+        const entries = ${payload};
         for (const [key, value] of Object.entries(entries)) {
           ${kind}.setItem(key, value);
         }
@@ -517,20 +777,68 @@ async function getPageInfo(client: Awaited<ReturnType<typeof createTabClient>>):
   };
 }
 
-async function waitForLifecycle(client: Awaited<ReturnType<typeof createTabClient>>, waitUntil: "domcontentloaded" | "load", timeoutMs: number): Promise<void> {
+// B2/B3/B8: returns {promise, cancel} so callers can register the listener BEFORE
+// triggering navigation (avoiding a race where the lifecycle event fires before we
+// subscribe), and cancel the timer + listener on early errors. The CDP event name on
+// chrome-remote-interface's EventEmitter is "Page.<event>" — this is the string we
+// must use for both subscribe and unsubscribe.
+function waitForLifecycle(
+  client: Awaited<ReturnType<typeof createTabClient>>,
+  waitUntil: "domcontentloaded" | "load",
+  timeoutMs: number
+): { promise: Promise<void>; cancel: () => void } {
   const eventName = waitUntil === "domcontentloaded" ? "domContentEventFired" : "loadEventFired";
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new ToolError("NAVIGATION_TIMEOUT", `Navigation did not reach ${waitUntil} within ${timeoutMs}ms`, true)), timeoutMs);
+  const cdpEvent = `Page.${eventName}`;
+  let settled = false;
+  let cancelFn: () => void = () => {};
+  const promise = new Promise<void>((resolve, reject) => {
+    const emitter = client as unknown as {
+      on: (evt: string, fn: () => void) => void;
+      removeListener: (evt: string, fn: () => void) => void;
+    };
     const handler = () => {
-      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        emitter.removeListener(cdpEvent, handler);
+      } catch {
+        // ignore if removeListener isn't supported on this binding
+      }
       resolve();
     };
-    if (eventName === "domContentEventFired") {
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        emitter.removeListener(cdpEvent, handler);
+      } catch {
+        // ignore
+      }
+      reject(new ToolError("NAVIGATION_TIMEOUT", `Navigation did not reach ${waitUntil} within ${timeoutMs}ms`, true));
+    }, timeoutMs);
+    cancelFn = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        emitter.removeListener(cdpEvent, handler);
+      } catch {
+        // ignore
+      }
+      // resolve so awaiters don't hang; the caller decides whether to throw.
+      resolve();
+    };
+    if (typeof emitter.on === "function") {
+      emitter.on(cdpEvent, handler);
+    } else if (eventName === "domContentEventFired") {
+      // Fallback to the helper API if direct EventEmitter access isn't available.
       client.Page.domContentEventFired(handler);
     } else {
       client.Page.loadEventFired(handler);
     }
   });
+  return { promise, cancel: () => cancelFn() };
 }
 
 async function resolveTarget(sessionManager: SessionManager, client: Awaited<ReturnType<typeof createTabClient>>, sessionId: string, tabId: string, target: TargetQuery): Promise<ResolvedNode> {
@@ -568,7 +876,8 @@ async function resolveTarget(sessionManager: SessionManager, client: Awaited<Ret
 }
 
 async function resolveBySelector(client: Awaited<ReturnType<typeof createTabClient>>, selector: string, frameId?: string): Promise<ResolvedNode> {
-  const root = await client.DOM.getDocument({ depth: -1 });
+  // B15: depth: 1 — we only need the document root nodeId for querySelector.
+  const root = await client.DOM.getDocument({ depth: 1 });
   const node = await client.DOM.querySelector({
     nodeId: root.root.nodeId,
     selector
@@ -586,15 +895,16 @@ async function resolveBySelector(client: Awaited<ReturnType<typeof createTabClie
 }
 
 async function resolveByText(client: Awaited<ReturnType<typeof createTabClient>>, textQuery: string): Promise<ResolvedNode> {
-  const root = await client.DOM.getDocument({ depth: -1 });
+  const root = await client.DOM.getDocument({ depth: 1 });
+  const stamp = `mcp-${Date.now()}`;
   const result = await evaluateJson(
     client,
     `(() => {
       const candidates = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"]'));
       const target = candidates.find((el) => (el.innerText || el.textContent || '').includes(${JSON.stringify(textQuery)}));
       if (!target) return null;
-      if (target.id) return '#' + target.id;
-      return target.tagName.toLowerCase();
+      target.setAttribute('data-mcp-resolved', ${JSON.stringify(stamp)});
+      return '[data-mcp-resolved="${stamp.replace(/"/g, '\\"')}"]';
     })()`
   );
   if (typeof result.value !== "string") {
@@ -603,13 +913,25 @@ async function resolveByText(client: Awaited<ReturnType<typeof createTabClient>>
   return resolveBySelector(client, result.value, root.root.frameId);
 }
 
+// B14: surface unfocusable / collapsed elements as ELEMENT_NOT_INTERACTABLE rather than
+// crashing on an undefined quad.
 async function getBoxCenter(client: Awaited<ReturnType<typeof createTabClient>>, backendNodeId: number): Promise<{ x: number; y: number }> {
-  const box = await client.DOM.getBoxModel({ backendNodeId });
-  const quad = box.model.content;
-  return {
-    x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
-    y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4
-  };
+  try {
+    const box = await client.DOM.getBoxModel({ backendNodeId });
+    const quad = box.model.content;
+    const [x0, y0, x1, y1, x2, y2, x3, y3] = quad;
+    if (x0 === undefined || y0 === undefined || x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined || x3 === undefined || y3 === undefined) {
+      throw new Error("incomplete content quad");
+    }
+    return {
+      x: (x0 + x1 + x2 + x3) / 4,
+      y: (y0 + y1 + y2 + y3) / 4
+    };
+  } catch (error) {
+    throw new ToolError("ELEMENT_NOT_INTERACTABLE", "Element has no usable bounding box", false, {
+      cause: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 async function evaluateJson(client: Awaited<ReturnType<typeof createTabClient>>, expression: string): Promise<RuntimeJsonResult> {
@@ -704,8 +1026,9 @@ function resolveKeyDefinition(input: string): { key: string; code: string; windo
     end: { key: "End", code: "End", windowsVirtualKeyCode: 35 }
   };
 
-  if (known[normalized]) {
-    return known[normalized];
+  const hit = known[normalized];
+  if (hit) {
+    return hit;
   }
 
   if (input.length === 1) {
