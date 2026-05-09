@@ -45,20 +45,27 @@
 | 管理タブ | MCP が開いたタブのメモ付け (`browser_note_tab`) と自動クリーンアップ |
 | 安全弁 | デフォルトで `browser_eval` と file upload を**無効化**、環境変数で許可制 |
 
-提供ツール数: **36 個** (`browser_*`)
+提供ツール数: **40 個** (`browser_*`)
 
 ## 安全モデル
 
 | 設定 | デフォルト | 環境変数 |
 |---|---|---|
-| Attach 許可 | 有効 | `MCP_BROWSER_ALLOW_ATTACH` |
-| Launch 許可 | 有効 | `MCP_BROWSER_ALLOW_LAUNCH` |
+| Attach 許可 | 有効 | `MCP_BROWSER_ALLOW_ATTACH` (default 1, set =0 to disable) |
+| Launch 許可 | 有効 | `MCP_BROWSER_ALLOW_LAUNCH` (default 1, set =0 to disable) |
 | `browser_eval` (任意 JS 実行) | **無効** | `MCP_BROWSER_ALLOW_EVAL=1` |
-| ファイルアップロード | **無効** | `MCP_BROWSER_ALLOW_FILE_UPLOAD=1` |
-| 許可アップロードルート | なし | `MCP_BROWSER_ALLOWED_UPLOAD_ROOTS` |
+| プライベートネットワーク (SSRF 解除) | **無効** | `MCP_BROWSER_ALLOW_PRIVATE_NETWORKS=1` |
+| 非ループバックホストへの attach | **無効** | `MCP_BROWSER_ALLOW_REMOTE_ATTACH=1` |
+| 別オリジンへの cookie set (attach 中) | **無効** | `MCP_BROWSER_ALLOW_CROSS_ORIGIN_COOKIES=1` |
+| `browser_launch` 用 executable 許可リスト | なし | `MCP_BROWSER_ALLOWED_EXECUTABLES` |
+| PDF filePath 読み取り許可ルート | downloads + temp | `MCP_BROWSER_ALLOWED_READ_ROOTS` |
 
 `browser_eval` は任意の JavaScript を実行できるためデフォルトで無効。明示的に許可するまで実行できません。
 `launch + browser-default profile` (ユーザーの普段使いプロファイルを丸ごと起動) は意図的にサポートしていません — 隔離プロファイル or 明示パスのみ。
+
+`browser_navigate` / `browser_new_tab` / `browser_pdf_open` / `browser_pdf_extract` には SSRF ガードがあり、`localhost` / プライベート IP / 非 http(s) スキームをデフォルトで拒否します。テスト等で許可したいときは `MCP_BROWSER_ALLOW_PRIVATE_NETWORKS=1` を立ててください。
+
+ファイルアップロード機能は現状未実装です（`MCP_BROWSER_ALLOW_FILE_UPLOAD` / `MCP_BROWSER_ALLOWED_UPLOAD_ROOTS` は将来用の設定項目として残してあります）。
 
 ## 処理フロー
 
@@ -141,25 +148,44 @@ npm run typecheck  # 型チェックのみ
 | 変数 | 用途 |
 |---|---|
 | `MCP_BROWSER_LOG_LEVEL` | ログレベル (`debug` / `info` / `warn` / `error`) |
-| `MCP_BROWSER_ALLOW_ATTACH` | attach モード許可 |
-| `MCP_BROWSER_ALLOW_LAUNCH` | launch モード許可 |
-| `MCP_BROWSER_ALLOW_EVAL` | `browser_eval` を有効化 |
-| `MCP_BROWSER_ALLOW_FILE_UPLOAD` | ファイルアップロード有効化 |
-| `MCP_BROWSER_ALLOWED_UPLOAD_ROOTS` | アップロード許可ディレクトリ (`;` 区切り) |
+| `MCP_BROWSER_ALLOW_ATTACH` | attach モード許可 (default `1`) |
+| `MCP_BROWSER_ALLOW_LAUNCH` | launch モード許可 (default `1`) |
+| `MCP_BROWSER_ALLOW_EVAL` | `browser_eval` を有効化 (default `0`) |
+| `MCP_BROWSER_ALLOW_PRIVATE_NETWORKS` | localhost / プライベート IP への navigate/PDF 許可 (default `0`) |
+| `MCP_BROWSER_ALLOW_REMOTE_ATTACH` | 非ループバックホストへの `browser_connect` 許可 (default `0`) |
+| `MCP_BROWSER_ALLOW_CROSS_ORIGIN_COOKIES` | attach 中の cookie set でドメイン制限を解除 (default `0`) |
+| `MCP_BROWSER_ALLOWED_EXECUTABLES` | `browser_launch` の `executablePath` 許可リスト (`;` 区切り) |
+| `MCP_BROWSER_ALLOWED_PROFILE_ROOTS` | `profileMode='profile-path'` の許可ルート (default: temp dir) |
+| `MCP_BROWSER_ALLOWED_READ_ROOTS` | `browser_pdf_extract` の filePath 読取許可ルート (default: downloads + temp) |
+| `MCP_BROWSER_ALLOW_FILE_UPLOAD` | ファイルアップロードの将来用フラグ (現在未実装) |
+| `MCP_BROWSER_ALLOWED_UPLOAD_ROOTS` | 同上 (将来用) |
 | `MCP_BROWSER_DOWNLOAD_DIR` | ダウンロード保存先 |
 | `MCP_BROWSER_SCREENSHOT_DIR` | スクリーンショット保存先 (既定: `~/.mcp-browser-local/screenshots`) |
 | `MCP_BROWSER_TEMP_DIR` | 一時ファイル保存先 |
+| `MCP_BROWSER_DEFAULT_TIMEOUT_MS` | コマンド既定タイムアウト (default `15000`) |
+| `MCP_BROWSER_MAX_SNAPSHOT_ELEMENTS` | snapshot 最大要素数 (default `80`) |
+| `MCP_BROWSER_MAX_TEXT_CHARS` | `browser_get_text` 最大文字数 (default `12000`) |
+| `MCP_BROWSER_MAX_HTML_CHARS` | `browser_get_html` 最大文字数 (default `20000`) |
+| `MCP_BROWSER_MAX_EVAL_RESULT_CHARS` | `browser_eval` 結果サイズ上限 (default `4000`) |
+| `MCP_BROWSER_MAX_EVAL_RESULT_ITEMS` | `browser_eval` 結果アイテム数上限 (default `100`) |
+| `MCP_BROWSER_MAX_EVAL_EXPRESSION_CHARS` | `browser_eval` 式長さ上限 (default `10240`) |
+| `MCP_BROWSER_MAX_ELEMENT_REFS` | elementRef のグローバル数 (default `5000`、超過時 FIFO) |
+| `MCP_BROWSER_MAX_TABS_PER_SESSION` | セッション当たりタブ上限 (default `64`) |
+| `MCP_BROWSER_MAX_SESSIONS` | 並行セッション上限 (default `16`) |
+| `MCP_BROWSER_MAX_NOTES_PER_TAB` | タブ当たり notes 上限 (default `200`) |
+| `MCP_BROWSER_MAX_PDF_BYTES` | PDF 抽出のバイト上限 (default `200MiB`) |
+| `MCP_BROWSER_MAX_PDF_PAGES` | PDF 抽出のページ上限 (default `200`) |
 
-## 主要ツール一覧 (36 個)
+## 主要ツール一覧 (40 個)
 
 | カテゴリ | ツール |
 |---|---|
 | 検出 | `browser_list_installations`, `browser_list_running` |
 | セッション | `browser_connect`, `browser_launch`, `browser_disconnect`, `browser_list_sessions`, `browser_get_session` |
 | タブ管理 | `browser_list_tabs`, `browser_new_tab`, `browser_activate_tab`, `browser_close_tab`, `browser_list_managed_tabs`, `browser_note_tab` |
-| ナビゲーション | `browser_navigate`, `browser_go_back`, `browser_go_forward`, `browser_reload`, `browser_wait_for` |
+| ナビゲーション | `browser_navigate`, `browser_go_back`, `browser_go_forward`, `browser_reload`, `browser_wait_for`, `browser_wait_for_network_idle` |
 | ページ読み取り | `browser_snapshot`, `browser_get_text`, `browser_get_html`, `browser_eval` |
-| 入力 | `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll` |
+| 入力 | `browser_click`, `browser_hover`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_select_option`, `browser_set_checked` |
 | 撮影 | `browser_take_screenshot` |
 | PDF | `browser_pdf_open`, `browser_pdf_viewer_state`, `browser_pdf_next_page`, `browser_pdf_prev_page`, `browser_pdf_extract` |
 | Cookie / Storage | `browser_get_cookies`, `browser_set_cookies`, `browser_storage_get`, `browser_storage_set` |
