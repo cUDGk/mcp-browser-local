@@ -218,6 +218,24 @@ npm run typecheck  # 型チェックのみ
 
 ## 変更履歴
 
+### 0.1.2
+
+- セキュリティ: NAT64 `64:ff9b::/96` プレフィックスをデコードしてプライベート IPv4 ルールと照合 (S1)
+- セキュリティ: 予約済み TLD `.test` / `.example` / `.invalid` をブロックリストに追加 (S2)
+- セキュリティ: PDF リダイレクトループを合計デッドラインから派生した `AbortController` で管理 (S3)
+- セキュリティ: `scrollPage` の数値インジェクションガード (`Number()` 強制変換) (S4)
+- セキュリティ: `browser_set_cookies` の eTLD+1 チェックを `url` のみ指定の Cookie にも適用 (S5)
+- セキュリティ: `evaluateExpression` の正規化処理に `//` コメント除去と `\xXX` 16進デコードを追加 (S6)
+- バグ修正: `goBack` / `goForward` のライフサイクルリスナーリーク修正 — `wait.cancel()` を `finally` で無条件呼出 (B1)
+- バグ修正: `waitForLifecycle` のフォールバックで重複リスナー登録を回避 (B2)
+- バグ修正: `evaluateExpression` の内部変数シャドウイング修正 (B3)
+- バグ修正: `browser_pdf_open` (`newTab: true`) でナビゲーション完了を待機してから PDF ビューアを読む (B4)
+- バグ修正: `browser_disconnect` の `markTabClosed` をタブ消滅確認後に移動 (B5)
+- バグ修正: `setActiveTab` の上限チェックを `activeTabId` 更新前に実行 (B6)
+- バグ修正: `resolveByText` が `data-mcp-resolved` 属性を設定し属性セレクターで要素を一意に特定 (B7)
+- UX: 新規ツール追加 — `browser_hover`, `browser_select_option`, `browser_set_checked`, `browser_wait_for_network_idle` (R3)
+- UX: `browser_reload` にオプションの `timeoutMs` パラメータを追加 (U8)
+
 ### 0.1.1
 
 - Claude Code などの LLM クライアントが object / array 型の引数を JSON 文字列として送ってくる挙動に対応。`target` / `windowSize` / `cookies` / `entries` / `pages` などを文字列で受け取っても zod reject せずに自動で JSON パースしてから検証する
